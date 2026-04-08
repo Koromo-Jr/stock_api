@@ -1,51 +1,62 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 import yfinance as yf
+from sqlalchemy.orm import Session
+import models, database
 
 # 建立 FastAPI 總機
 app = FastAPI()
 
+# 在啟動時建立資料表 (這行很重要，它是幫你在 SQLite 裡蓋房子的動作)
+models.Base.metadata.create_all(bind=database.engine)
+
+# 取得資料庫連線的小工具 (Dependency Injection)
+def get_db():
+    db = database.SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- 功能 1：抓取最新報價 ---
 @app.get("/quote/{ticker}")
 def get_stock_quote(ticker: str):
     try:
-        # 1. 召喚 yfinance 小幫手
         stock = yf.Ticker(ticker)
+        # 【修正點】改抓 period="5d"，確保我們一定拿得到「昨天」的收盤價
+        hist = stock.history(period="5d")
         
-        # 2. 抓取最近 1 天的歷史交易資料
-        hist = stock.history(period="1d")
-
-        # 這就是工程師的透視眼
-        print("\n=== 這是跑腿小弟帶回來的真實資料 ===")
-        print(hist)
-        print("====================================\n")
-        
-        # 3. 防呆機制：如果抓回來的資料是空的
-        if hist.empty:
-            raise HTTPException(status_code=404, detail=f"找不到代碼：{ticker}。台股請記得加上 .TW 或 .TWO 喔！")
+        if hist.empty or len(hist) < 2:
+            raise HTTPException(status_code=404, detail=f"找不到代碼或歷史資料不足：{ticker}")
             
-        # 4. 抽出最新收盤價
-        # iloc 的全名是 Index Location（索引定位），意思是「我要指定第幾『橫列 (Row)』」
-        # [-1]就是倒數第一個的意思(最後一個)
-
-        # 1. 最新收盤價 (倒數第一筆)
         latest_price = hist['Close'].iloc[-1]
-        # 2. 今日開盤價 (倒數第一筆)
         open_price = hist['Open'].iloc[-1]
-        # 3. 昨天的收盤價 (倒數第二筆！用 -2 來定位)
-        yesterday_price = hist['Close'].iloc[-2]
-        # 4. 計算漲跌幅：(今天收盤 - 昨天收盤) / 昨天收盤 * 100
+        yesterday_price = hist['Close'].iloc[-2] # 拿倒數第二筆，就是昨收
         change_percent = ((latest_price - yesterday_price) / yesterday_price) * 100
 
         return {
             "stock_symbol": ticker.upper(),
             "open_price": round(open_price, 2),
             "latest_price": round(latest_price, 2),
-            "change_percent": f"{round(change_percent, 2)}%", # 加上 % 符號讓它更直覺
+            "change_percent": f"{round(change_percent, 2)}%",
             "message": "這是您要的最新報價！"
         }
-        
-    except HTTPException:
-        # 如果是我們自己發出的 404 找不到代碼錯誤，就直接往外丟
-        raise
     except Exception as e:
-        # 萬一 Yahoo Finance 網路斷線或發生其他未知的錯誤，我們會優雅地擋下來
-        raise HTTPException(status_code=500, detail=f"抓取資料時發生異常，可能是網路連線問題。錯誤細節：{str(e)}")
+        raise HTTPException(status_code=500, detail=f"伺服器錯誤：{str(e)}")
+
+# --- 功能 2：新增到自選清單 (POST) ---
+@app.post("/watchlist/{ticker}")
+def add_to_watchlist(ticker: str, db: Session = Depends(get_db)):
+    # 統一轉大寫，避免 2330.tw 和 2330.TW 被判定成不同股票
+    ticker_upper = ticker.upper()
+    
+    # 防呆：檢查是否重複
+    exists = db.query(models.Watchlist).filter(models.Watchlist.ticker == ticker_upper).first()
+    if exists:
+        raise HTTPException(status_code=400, detail="這檔股票已經在清單中囉！")
+    
+    # 存入資料庫
+    new_stock = models.Watchlist(ticker=ticker_upper)
+    db.add(new_stock)
+    db.commit()
+    
+    return {"message": f"成功將 {ticker_upper} 加入自選清單！"}
